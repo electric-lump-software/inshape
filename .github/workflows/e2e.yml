@@ -1,0 +1,161 @@
+name: End to end
+
+on:
+  push:
+    tags: ["v*"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: e2e ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      INFISICAL_API_URL: https://app.infisical.com
+      INFISICAL_ENV: staging
+      INFISICAL_PATHS: /one /two
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.target }}
+      - name: Install musl-tools and tinyproxy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools tinyproxy
+          sudo systemctl disable --now tinyproxy
+      - name: Build
+        run: scripts/build-release.sh "$TARGET" "$RUNNER_TEMP/bin"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inshape-${{ matrix.target }}
+          path: ${{ runner.temp }}/bin/inshape-${{ matrix.target }}
+          if-no-files-found: error
+
+      - name: Direct
+        id: direct
+        env:
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: ${{ secrets.INSHAPE_E2E_CLIENT_ID }}
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: ${{ secrets.INSHAPE_E2E_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INSHAPE_E2E_PROJECT_ID }}
+        run: e2e/expect.sh "$RUNNER_TEMP/bin/inshape-$TARGET" 0
+
+      - name: Start the proxy
+        id: proxy
+        if: ${{ !cancelled() }}
+        run: |
+          pw="$(openssl rand -hex 16)"
+          echo "::add-mask::$pw"
+          echo "PROXY_PW=$pw" >> "$GITHUB_ENV"
+          conf="$RUNNER_TEMP/tinyproxy.conf"
+          umask 077
+          cat > "$conf" <<CONF
+          Port 8888
+          Listen 127.0.0.1
+          Allow 127.0.0.1
+          BasicAuth e2e $pw
+          ConnectPort 443
+          LogFile "$RUNNER_TEMP/tinyproxy.log"
+          PidFile "$RUNNER_TEMP/tinyproxy.pid"
+          LogLevel Info
+          CONF
+          tinyproxy -c "$conf"
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8888) 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "the proxy did not start"
+          exit 1
+
+      - name: Through the proxy
+        id: via_proxy
+        if: ${{ !cancelled() }}
+        env:
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: ${{ secrets.INSHAPE_E2E_CLIENT_ID }}
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: ${{ secrets.INSHAPE_E2E_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INSHAPE_E2E_PROJECT_ID }}
+        run: |
+          trap 'status=$?; if [ "$status" -ne 0 ]; then echo "proxy log, CONNECT lines:"; grep CONNECT "$RUNNER_TEMP/tinyproxy.log" || true; fi' EXIT
+          host="${INFISICAL_API_URL#https://}"
+          export INFISICAL_PROXY_URL="http://e2e:${PROXY_PW}@127.0.0.1:8888"
+          e2e/expect.sh "$RUNNER_TEMP/bin/inshape-$TARGET" 0
+          if ! grep -q "CONNECT $host:443" "$RUNNER_TEMP/tinyproxy.log"; then
+            echo "FAIL: the proxy log shows no CONNECT to the Infisical host"
+            exit 1
+          fi
+          echo "ok: the proxy log shows a CONNECT to the Infisical host"
+
+      - name: Summary
+        if: always()
+        env:
+          DIRECT: ${{ steps.direct.outcome }}
+          VIA_PROXY: ${{ steps.via_proxy.outcome }}
+        run: |
+          {
+            echo "### e2e $TARGET"
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Direct | $DIRECT |"
+            echo "| Through the proxy | $VIA_PROXY |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bad-credentials:
+    name: bad credentials
+    needs: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      INFISICAL_API_URL: https://app.infisical.com
+      INFISICAL_ENV: staging
+      INFISICAL_PATHS: /one /two
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: inshape-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/bin
+      - name: Wrong client secret exits 77
+        id: bad
+        env:
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: ${{ secrets.INSHAPE_E2E_CLIENT_ID }}
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: not-the-client-secret
+          INFISICAL_PROJECT_ID: ${{ secrets.INSHAPE_E2E_PROJECT_ID }}
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/inshape-x86_64-unknown-linux-musl"
+          e2e/expect.sh "$RUNNER_TEMP/bin/inshape-x86_64-unknown-linux-musl" 77
+      - name: Summary
+        if: always()
+        env:
+          BAD: ${{ steps.bad.outcome }}
+        run: |
+          {
+            echo "### e2e bad credentials"
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Wrong client secret (exit 77) | $BAD |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,26 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"

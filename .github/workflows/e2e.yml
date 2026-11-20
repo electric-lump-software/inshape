@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 30
     env:
       TARGET: ${{ matrix.target }}
-      INFISICAL_API_URL: https://app.infisical.com
+      INFISICAL_API_URL: https://eu.infisical.com
       INFISICAL_ENV: staging
       INFISICAL_PATHS: /one /two
     steps:
@@ -128,7 +128,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      INFISICAL_API_URL: https://app.infisical.com
+      INFISICAL_API_URL: https://eu.infisical.com
       INFISICAL_ENV: staging
       INFISICAL_PATHS: /one /two
     steps:
